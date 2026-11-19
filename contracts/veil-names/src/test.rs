@@ -12,12 +12,12 @@ extern crate std;
 use soroban_sdk::{
     testutils::{Address as _, Ledger as _},
     token::StellarAssetClient,
-    Address, BytesN, Env, String,
+    Address, Bytes, BytesN, Env, String,
 };
 
 use crate::{
-    Error, NameState, VeilNames, VeilNamesClient, MAX_TERM_YEARS, RECOVERY_SECONDS, UNIT,
-    YEAR_SECONDS,
+    Error, NameState, VeilNames, VeilNamesClient, MAX_TERM_YEARS, META_ADDRESS_LEN,
+    RECOVERY_SECONDS, UNIT, YEAR_SECONDS,
 };
 
 struct Fixture {
@@ -74,6 +74,13 @@ fn balance(f: &Fixture, who: &Address) -> i128 {
 
 fn warp(f: &Fixture, to: u64) {
     f.e.ledger().with_mut(|l| l.timestamp = to);
+}
+
+/// A meta-address of the right shape. The bytes do not need to be a valid
+/// curve point for the registry — the length is the only thing it can check
+/// without a crypto dependency, and a sender is what turns them into one.
+fn meta(e: &Env) -> Bytes {
+    Bytes::from_array(e, &[7u8; META_ADDRESS_LEN as usize])
 }
 
 // ───────────────────────── pricing ─────────────────────────
@@ -482,6 +489,156 @@ fn an_expired_name_cannot_be_re_targeted() {
         f.client.try_set_target(&n, &f.bob),
         Err(Ok(err(Error::NameNotFound)))
     );
+}
+
+// ───────────────────────── private payments ─────────────────────────
+//
+// A meta-address is opt-in, owner-only, and a refusal once removed. The tests
+// that matter are the ones proving nobody else can publish one and that a
+// name without one says so instead of handing back a public destination.
+
+#[test]
+fn a_name_starts_without_a_meta_address() {
+    // Not "null address", not a zero key — absent. A default here would be a
+    // privacy record nobody opted into, which is the one thing this feature
+    // must not do.
+    let f = setup();
+    f.client.register(&f.alice, &name(&f.e, "adebayo"), &1);
+    assert_eq!(f.client.meta_address(&name(&f.e, "adebayo")), None);
+}
+
+#[test]
+fn the_holder_can_publish_a_meta_address() {
+    let f = setup();
+    let n = name(&f.e, "adebayo");
+    f.client.register(&f.alice, &n, &1);
+
+    f.client.set_meta_address(&n, &meta(&f.e));
+
+    assert_eq!(f.client.meta_address(&n), Some(meta(&f.e)));
+    // Publishing a privacy record does not move the name: a plain payment
+    // still goes to the holder's contract address.
+    assert_eq!(f.client.resolve(&n), Some(f.alice.clone()));
+}
+
+#[test]
+fn a_stranger_cannot_publish_a_meta_address() {
+    // The whole promise of an opt-in record is that its owner chose it. If any
+    // caller could point somebody else's name at their own viewing key, every
+    // private payment to that name would be visible to — and spendable by —
+    // the caller.
+    let f = setup();
+    let n = name(&f.e, "adebayo");
+    f.client.register(&f.alice, &n, &1);
+
+    f.e.set_auths(&[]);
+    assert!(f.client.try_set_meta_address(&n, &meta(&f.e)).is_err());
+
+    f.e.mock_all_auths();
+    assert_eq!(f.client.meta_address(&n), None);
+}
+
+#[test]
+fn a_meta_address_must_be_the_exact_length() {
+    let f = setup();
+    let n = name(&f.e, "adebayo");
+    f.client.register(&f.alice, &n, &1);
+
+    for len in [0u32, 31, 33, 64] {
+        let bad = Bytes::from_slice(&f.e, &[1u8; 64][..len as usize]);
+        assert_eq!(
+            f.client.try_set_meta_address(&n, &bad),
+            Err(Ok(err(Error::BadMetaAddressLength))),
+            "accepted a {len}-byte meta-address"
+        );
+    }
+}
+
+#[test]
+fn publishing_a_meta_address_needs_an_active_name() {
+    let f = setup();
+    let start = f.e.ledger().timestamp();
+    let n = name(&f.e, "adebayo");
+    f.client.register(&f.alice, &n, &1);
+
+    warp(&f, start + YEAR_SECONDS);
+    assert_eq!(
+        f.client.try_set_meta_address(&n, &meta(&f.e)),
+        Err(Ok(err(Error::NameNotFound)))
+    );
+}
+
+#[test]
+fn the_holder_can_remove_a_meta_address() {
+    let f = setup();
+    let n = name(&f.e, "adebayo");
+    f.client.register(&f.alice, &n, &1);
+    f.client.set_meta_address(&n, &meta(&f.e));
+
+    f.client.remove_meta_address(&n);
+
+    // Removed means absent, so a sender asking for a private payment is
+    // refused rather than handed a key its owner no longer monitors.
+    assert_eq!(f.client.meta_address(&n), None);
+    assert_eq!(f.client.resolve(&n), Some(f.alice.clone()));
+}
+
+#[test]
+fn a_stranger_cannot_remove_a_meta_address() {
+    let f = setup();
+    let n = name(&f.e, "adebayo");
+    f.client.register(&f.alice, &n, &1);
+    f.client.set_meta_address(&n, &meta(&f.e));
+
+    f.e.set_auths(&[]);
+    assert!(f.client.try_remove_meta_address(&n).is_err());
+
+    f.e.mock_all_auths();
+    assert_eq!(f.client.meta_address(&n), Some(meta(&f.e)));
+}
+
+#[test]
+fn removing_a_meta_address_that_was_never_set_is_refused() {
+    let f = setup();
+    let n = name(&f.e, "adebayo");
+    f.client.register(&f.alice, &n, &1);
+    assert_eq!(
+        f.client.try_remove_meta_address(&n),
+        Err(Ok(err(Error::NoMetaAddress)))
+    );
+}
+
+#[test]
+fn an_expired_name_has_no_meta_address() {
+    // A lapsed name must not keep handing out a stealth destination: the
+    // holder has no claim on the name, and a sender would be paying an address
+    // they cannot associate with anybody.
+    let f = setup();
+    let start = f.e.ledger().timestamp();
+    let n = name(&f.e, "adebayo");
+    f.client.register(&f.alice, &n, &1);
+    f.client.set_meta_address(&n, &meta(&f.e));
+
+    warp(&f, start + YEAR_SECONDS);
+    assert_eq!(f.client.meta_address(&n), None);
+}
+
+#[test]
+fn transferring_the_name_leaves_the_meta_address_with_the_name() {
+    // The record belongs to the name, not to the wallet that set it. A new
+    // holder can replace it, and until they do, senders are directed to a
+    // record the previous holder controls — which is why the doc tells a buyer
+    // to check it after taking over a name.
+    let f = setup();
+    let n = name(&f.e, "adebayo");
+    let token_id = f.client.register(&f.alice, &n, &1);
+    f.client.set_meta_address(&n, &meta(&f.e));
+
+    f.client.transfer(&f.alice, &f.bob, &token_id);
+    assert_eq!(f.client.meta_address(&n), Some(meta(&f.e)));
+
+    f.client.remove_meta_address(&n);
+    assert_eq!(f.client.meta_address(&n), None);
 }
 
 // ───────────────────────── setup ─────────────────────────

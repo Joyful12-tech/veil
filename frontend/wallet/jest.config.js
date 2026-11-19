@@ -28,6 +28,9 @@ const config = {
     '^@/(.*)$':         '<rootDir>/$1',
     '^@veil/utils$':    '<rootDir>/../../sdk/src/utils',
     '^@veil/sdk$':      '<rootDir>/../../sdk/src/index',
+    // The stealth module is their own entry point so importing it does not
+    // pull the SDK's React hook into server routes or jsdom tests.
+    '^@veil/stealth$':  '<rootDir>/../../sdk/src/stealth',
     '^@veil/events$':   '<rootDir>/../../sdk/src/events',
     '^@veil/recovery$': '<rootDir>/../../sdk/src/recovery/sep30',
     '^@veil/backup$':   '<rootDir>/../../sdk/src/backup',

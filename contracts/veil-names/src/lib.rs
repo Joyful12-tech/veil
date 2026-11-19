@@ -67,8 +67,8 @@
 //! enforced on-chain, and the client copies exist only to fail fast.
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, BytesN,
-    Env, String, Symbol,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, Bytes,
+    BytesN, Env, String, Symbol,
 };
 use stellar_tokens::non_fungible::{
     burnable::NonFungibleBurnable, Base, NonFungibleToken,
@@ -90,6 +90,14 @@ pub const MAX_TERM_YEARS: u32 = 5;
 
 /// Stroops per USDC. Stellar assets carry seven decimal places.
 pub const UNIT: i128 = 10_000_000;
+
+/// Bytes in a stealth meta-address: one X25519 viewing public key.
+///
+/// The length is enforced here rather than by convention because a sender
+/// derives an address from these bytes without asking anybody: a short value
+/// is not a smaller key, it is an underivable one, and it would publish a
+/// privacy record that can never be honoured.
+pub const META_ADDRESS_LEN: u32 = 32;
 
 /// Ledgers in roughly 30 days at five seconds a ledger, matching the TTL
 /// policy the factory contract already uses.
@@ -116,6 +124,10 @@ pub enum Error {
     NotAdmin = 12,
     /// A renewal would push the term past the maximum in one go.
     TermTooLong = 13,
+    /// A stealth meta-address must be exactly `META_ADDRESS_LEN` bytes.
+    BadMetaAddressLength = 14,
+    /// The name resolves, but its holder never opted into private payments.
+    NoMetaAddress = 15,
 }
 
 #[contracttype]
@@ -130,6 +142,13 @@ pub enum DataKey {
     Name(String),
     /// name -> () for names nobody may register
     Reserved(String),
+    /// name -> Bytes, only when the holder opted in.
+    ///
+    /// Deliberately separate from `Record`: a name that has never had a
+    /// privacy record must not gain a field that reads as one, and adding a
+    /// field to `Record` would change the layout of every stored name on an
+    /// upgradeable contract.
+    MetaAddress(String),
 }
 
 #[contracttype]
@@ -281,6 +300,17 @@ fn admin(e: &Env) -> Address {
         .instance()
         .get(&DataKey::Admin)
         .unwrap_or_else(|| panic_with_error!(e, Error::NotInitialized))
+}
+
+/// The name's record, if it is currently active. Expired names have no owner
+/// to authorise a change, so they cannot publish or withdraw a privacy record
+/// either — the record must not outlive the name that carries it.
+fn active_record(e: &Env, name: &String) -> Record {
+    let rec = load(e, name).unwrap_or_else(|| panic_with_error!(e, Error::NameNotFound));
+    if state_of(&rec, e.ledger().timestamp()) != NameState::Active {
+        panic_with_error!(e, Error::NameNotFound);
+    }
+    rec
 }
 
 // ───────────────────────── the registry ─────────────────────────
@@ -504,6 +534,80 @@ impl VeilNames {
         save(&e, &name, &rec);
         e.events()
             .publish((Symbol::new(&e, "renew"), name), (new_expiry, years));
+    }
+
+    /// Publish a stealth meta-address for a name, so a sender can derive a
+    /// one-time address instead of paying the contract address in public.
+    ///
+    /// **Opt-in, always.** There is no default value and no way for anyone
+    /// but the holder to set one: a name that silently gained a privacy record
+    /// would have published something about its owner. The holder may also
+    /// never have wanted private payments at all, which is why the record is
+    /// absent until this call is made.
+    ///
+    /// The bytes are a single X25519 viewing public key. They are public by
+    /// design — a meta-address is meant to be handed out — and reveal nothing
+    /// about past or future payments. Whoever holds the matching secret can
+    /// derive every one-time address a sender produces, so it belongs on the
+    /// holder's own device, not in the record.
+    pub fn set_meta_address(e: Env, name: String, meta_address: Bytes) {
+        let rec = active_record(&e, &name);
+        rec.owner.require_auth();
+        if meta_address.len() != META_ADDRESS_LEN {
+            panic_with_error!(&e, Error::BadMetaAddressLength);
+        }
+
+        let key = DataKey::MetaAddress(name.clone());
+        e.storage().persistent().set(&key, &meta_address);
+        e.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+        e.events().publish(
+            (Symbol::new(&e, "meta_address_set"), rec.owner, name),
+            meta_address,
+        );
+    }
+
+    /// Withdraw a name's stealth meta-address.
+    ///
+    /// Removal is a first-class operation, not an implied overwrite: a holder
+    /// who stops wanting private payments, or whose viewing key has been
+    /// compromised, must be able to make the name refuse private payments
+    /// again. After this, a sender that asks for a private payment is told the
+    /// name has no record rather than being handed an address that its owner
+    /// cannot spend.
+    pub fn remove_meta_address(e: Env, name: String) {
+        let rec = active_record(&e, &name);
+        rec.owner.require_auth();
+
+        let key = DataKey::MetaAddress(name.clone());
+        if !e.storage().persistent().has(&key) {
+            panic_with_error!(&e, Error::NoMetaAddress);
+        }
+        e.storage().persistent().remove(&key);
+        e.events()
+            .publish((Symbol::new(&e, "meta_address_removed"), rec.owner, name), ());
+    }
+
+    /// A name's stealth meta-address, or `None`.
+    ///
+    /// `None` is a refusal, not an invitation to fall back to a public
+    /// payment: it means this holder has not published a privacy record. An
+    /// expired name has no record either, so a stale contact cannot quietly
+    /// start paying a stranger's stealth address.
+    pub fn meta_address(e: Env, name: String) -> Option<Bytes> {
+        let rec = load(&e, &name)?;
+        if state_of(&rec, e.ledger().timestamp()) != NameState::Active {
+            return None;
+        }
+        let key = DataKey::MetaAddress(name);
+        let value: Option<Bytes> = e.storage().persistent().get(&key);
+        if value.is_some() {
+            e.storage()
+                .persistent()
+                .extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+        }
+        value
     }
 
     /// Point a name at a different address without moving the token.

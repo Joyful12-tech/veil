@@ -183,27 +183,31 @@ export function getNamesContractId(): string | null {
 /** Resolves a bare name to the address holding it, or null. */
 export type NameResolver = (name: string) => Promise<string | null>
 
+/** Bytes in a stealth meta-address, mirroring `META_ADDRESS_LEN` on-chain. */
+const META_ADDRESS_LENGTH = 32
+
 /**
- * Read `resolve(name)` off the registry contract.
+ * Simulate a read-only call on the registry.
  *
- * A simulation, not a submission: `resolve` is a read and costs nothing, so
- * there is no source account to fund. The dummy account below is never
- * charged and never signs — `simulateTransaction` only needs a well-formed
- * envelope to execute against.
+ * A simulation, not a submission: these are reads and cost nothing, so there is
+ * no source account to fund. The dummy account is never charged and never
+ * signs — `simulateTransaction` only needs a well-formed envelope.
  *
- * Any failure resolves to null rather than throwing. A federation server that
- * 500s on an RPC hiccup teaches callers that the name does not resolve *and*
- * that Veil is unreliable; a 404 says only the first, which is the truthful
- * part. `federation.ts` on the client draws exactly this distinction, and
- * `reverseResolution.ts` already degrades to null on an outage.
+ * `answered: false` means no provider could be asked. `answered: true` with an
+ * `undefined` value means the chain answered "no" (`Option::None`). Keeping
+ * those apart is what stops an RPC outage from being reported as an
+ * authoritative refusal.
  */
-export async function resolveOnChain(name: string): Promise<string | null> {
+async function simulateRegistry(
+  name: string,
+  method: string,
+): Promise<{ answered: boolean; value: unknown }> {
   const contractId = getNamesContractId()
-  if (!contractId) return null
+  if (!contractId) return { answered: false, value: null }
 
   const network = serverNetwork()
   const upstreams = network.rpcUrls
-  if (upstreams.length === 0) return null
+  if (upstreams.length === 0) return { answered: false, value: null }
 
   // Every upstream in turn, not just the first.
   //
@@ -228,7 +232,7 @@ export async function resolveOnChain(name: string): Promise<string | null> {
         fee: BASE_FEE,
         networkPassphrase: network.networkPassphrase,
       })
-        .addOperation(contract.call('resolve', nativeToScVal(name, { type: 'string' })))
+        .addOperation(contract.call(method, nativeToScVal(name, { type: 'string' })))
         .setTimeout(30)
         .build()
 
@@ -236,12 +240,10 @@ export async function resolveOnChain(name: string): Promise<string | null> {
       if (!SorobanRpc.Api.isSimulationSuccess(sim) || !sim.result) {
         // The chain answered and the answer was "no". That is a real result,
         // not a transport problem, so no other provider would say otherwise.
-        return null
+        return { answered: true, value: undefined }
       }
 
-      // `resolve` returns `Option<Address>`; a `None` natives to null/undefined.
-      const value = scValToNative(sim.result.retval)
-      return typeof value === 'string' && value.length > 0 ? value : null
+      return { answered: true, value: scValToNative(sim.result.retval) }
     } catch {
       sawTransportFailure = true
     }
@@ -249,26 +251,66 @@ export async function resolveOnChain(name: string): Promise<string | null> {
 
   if (sawTransportFailure) {
     // eslint-disable-next-line no-console
-    console.warn(`[federation] every RPC upstream failed resolving ${name}`)
+    console.warn(`[federation] every RPC upstream failed reading ${method}(${name})`)
   }
-  return null
+  return { answered: false, value: null }
+}
+
+/**
+ * Read `resolve(name)` off the registry contract.
+ *
+ * Any failure resolves to null rather than throwing. A federation server that
+ * 500s on an RPC hiccup teaches callers that the name does not resolve *and*
+ * that Veil is unreliable; a 404 says only the first, which is the truthful
+ * part. `federation.ts` on the client draws exactly this distinction, and
+ * `reverseResolution.ts` already degrades to null on an outage.
+ */
+export async function resolveOnChain(name: string): Promise<string | null> {
+  const { answered, value } = await simulateRegistry(name, 'resolve')
+  if (!answered) return null
+  // `resolve` returns `Option<Address>`; a `None` natives to null/undefined.
+  return typeof value === 'string' && value.length > 0 ? value : null
+}
+
+/**
+ * Read `meta_address(name)` off the registry contract, or null.
+ *
+ * Null means "no privacy record to publish" — no record set, expired name,
+ * unreadable value, or an RPC failure. All of those have the same behaviour for
+ * a sender: it cannot derive a one-time address, so it must refuse a private
+ * payment rather than fall back to the public contract address.
+ */
+export async function resolveMetaAddressOnChain(name: string): Promise<Uint8Array | null> {
+  const { answered, value } = await simulateRegistry(name, 'meta_address')
+  if (!answered) return null
+  if (!(value instanceof Uint8Array) || value.length !== META_ADDRESS_LENGTH) return null
+  return Uint8Array.from(value)
 }
 
 /** A SEP-2 `type=name` answer. */
 export interface FederationNameRecord {
   stellar_address: string
   account_id: string
+  /**
+   * Opt-in stealth meta-address, base64, when the holder published one.
+   *
+   * SEP-2 allows extra fields; wallets that do not know this one ignore it.
+   * Present only when the name actually carries a record — the field's absence
+   * is what makes a private send refuse rather than send publicly.
+   */
+  meta_address?: string
 }
 
 /**
  * Resolve a federated address to a record, or null.
  *
- * `resolver` is injectable so the route can be tested without an RPC server;
- * the default reads the chain.
+ * Both resolvers are injectable so the route can be tested without an RPC
+ * server; the defaults read the chain.
  */
 export async function lookupFederationName(
   q: string,
   resolver: NameResolver = resolveOnChain,
+  metaResolver: (name: string) => Promise<Uint8Array | null> = resolveMetaAddressOnChain,
 ): Promise<FederationNameRecord | null> {
   const parsed = parseFederationName(q)
   if (!parsed) return null
@@ -276,8 +318,13 @@ export async function lookupFederationName(
   const accountId = await resolver(parsed.name)
   if (!accountId) return null
 
-  return {
+  const record: FederationNameRecord = {
     stellar_address: `${parsed.name}*${parsed.domain}`,
     account_id: accountId,
   }
+
+  const metaAddress = await metaResolver(parsed.name)
+  if (metaAddress) record.meta_address = Buffer.from(metaAddress).toString('base64')
+
+  return record
 }

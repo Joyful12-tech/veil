@@ -125,8 +125,15 @@ describe('getNamesContractId', () => {
 })
 
 describe('lookupFederationName', () => {
+  /** These cases do not care about the privacy record; say so explicitly. */
+  const noMeta = async () => null
+
   it('returns the record a wallet needs, with the canonical address echoed back', async () => {
-    const record = await lookupFederationName('Adebayo*UseVeilApp.xyz', async () => 'CWALLET123')
+    const record = await lookupFederationName(
+      'Adebayo*UseVeilApp.xyz',
+      async () => 'CWALLET123',
+      noMeta,
+    )
 
     expect(record).toEqual({
       // Echoed normalized, so a caller that uppercased the query still gets
@@ -137,15 +144,17 @@ describe('lookupFederationName', () => {
   })
 
   it('is null when the name is not registered', async () => {
-    expect(await lookupFederationName('adebayo*useveilapp.xyz', async () => null)).toBeNull()
+    expect(
+      await lookupFederationName('adebayo*useveilapp.xyz', async () => null, noMeta),
+    ).toBeNull()
   })
 
   it('never calls the resolver for a query that is not ours', async () => {
     const resolver = jest.fn(async () => 'CWALLET123')
 
-    expect(await lookupFederationName('adebayo*lobstr.co', resolver)).toBeNull()
-    expect(await lookupFederationName('ab*useveilapp.xyz', resolver)).toBeNull()
-    expect(await lookupFederationName('not-a-federated-address', resolver)).toBeNull()
+    expect(await lookupFederationName('adebayo*lobstr.co', resolver, noMeta)).toBeNull()
+    expect(await lookupFederationName('ab*useveilapp.xyz', resolver, noMeta)).toBeNull()
+    expect(await lookupFederationName('not-a-federated-address', resolver, noMeta)).toBeNull()
 
     // An RPC round trip for something the registry could never hold is pure
     // latency, and on mainnet it is a metered QuickNode call.
@@ -154,13 +163,54 @@ describe('lookupFederationName', () => {
 
   it('passes the bare name to the resolver, not the full address', async () => {
     const resolver = jest.fn(async () => 'CWALLET123')
-    await lookupFederationName('adebayo*useveilapp.xyz', resolver)
+    await lookupFederationName('adebayo*useveilapp.xyz', resolver, noMeta)
 
     expect(resolver).toHaveBeenCalledWith('adebayo')
   })
 
   it('treats an empty resolver answer as unregistered, not as an address', async () => {
-    expect(await lookupFederationName('adebayo*useveilapp.xyz', async () => '')).toBeNull()
+    expect(
+      await lookupFederationName('adebayo*useveilapp.xyz', async () => '', noMeta),
+    ).toBeNull()
+  })
+
+  it('publishes the privacy record when the name carries one', async () => {
+    // A sender needs the meta-address to derive a one-time address. Without it
+    // in this answer, "send privately to ada.veil" would need a second lookup
+    // and a second protocol; SEP-2 permits extra fields for exactly this.
+    const metaAddress = new Uint8Array(32).fill(3)
+    const record = await lookupFederationName(
+      'adebayo*useveilapp.xyz',
+      async () => 'CWALLET123',
+      async () => metaAddress,
+    )
+
+    expect(record).toEqual({
+      stellar_address: 'adebayo*useveilapp.xyz',
+      account_id: 'CWALLET123',
+      meta_address: Buffer.from(metaAddress).toString('base64'),
+    })
+  })
+
+  it('omits the field when the holder never opted in', async () => {
+    // Absence is the refusal. A default value here would be a privacy record
+    // nobody published, and the sender would derive an address its owner
+    // cannot spend.
+    const record = await lookupFederationName(
+      'adebayo*useveilapp.xyz',
+      async () => 'CWALLET123',
+      noMeta,
+    )
+
+    expect(record).not.toBeNull()
+    expect(record).not.toHaveProperty('meta_address')
+  })
+
+  it('does not call the meta resolver for a name it cannot resolve', async () => {
+    const metaResolver = jest.fn(async () => new Uint8Array(32))
+    await lookupFederationName('adebayo*useveilapp.xyz', async () => null, metaResolver)
+
+    expect(metaResolver).not.toHaveBeenCalled()
   })
 })
 

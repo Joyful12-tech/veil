@@ -97,6 +97,21 @@
         "default": "./dist/esm/angular/index.js"
       }
     },
+    "./stealth": {
+      "react-native": {
+        "types": "./dist/stealth.d.ts",
+        "default": "./src/stealth.ts"
+      },
+      "import": {
+        "types": "./dist/esm/stealth.d.ts",
+        "default": "./dist/esm/stealth.js"
+      },
+      "require": {
+        "types": "./dist/stealth.d.ts",
+        "default": "./dist/stealth.js"
+      },
+      "default": "./dist/stealth.js"
+    },
     "./stellar-wallets-kit": {
       "react-native": "./src/stellarWalletsKit.ts",
       "import": {
@@ -147,6 +162,7 @@
     "node": ">=20"
   },
   "dependencies": {
+    "@noble/curves": "^1.9.7",
     "@stellar/stellar-sdk": "^15.1.0"
   },
   "peerDependencies": {
