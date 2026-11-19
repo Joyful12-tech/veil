@@ -34,6 +34,12 @@ import {
   topUpWalletUsdc,
 } from '@/lib/namesPurchase'
 import {
+  lookupNameMetaAddress,
+  publishNameMetaAddress,
+  removeNameMetaAddress,
+  stealthIdentityFromSeed,
+} from '@/lib/stealthNames'
+import {
   MAX_NAME_LENGTH,
   MAX_TERM_YEARS,
   MIN_NAME_LENGTH,
@@ -124,6 +130,12 @@ export default function NamesPage() {
   // here at all. Read once, up front: finding out by burning a passkey prompt
   // on a transaction that can only revert is the worst way to learn it.
   const [lockedOrigin, setLockedOrigin] = useState<string | null>(null)
+  // The name's opt-in privacy record. `null` means it has not been read yet;
+  // 'absent' is the honest default a name starts with.
+  const [metaState, setMetaState] = useState<'absent' | 'present' | 'unavailable' | null>(null)
+  const [metaBusy, setMetaBusy] = useState(false)
+  const [metaError, setMetaError] = useState<string | null>(null)
+  const [metaNotice, setMetaNotice] = useState<string | null>(null)
 
   useEffect(() => {
     const addr = walletSession.getItem('invisible_wallet_address')
@@ -268,6 +280,74 @@ export default function NamesPage() {
     } finally {
       setIsBuying(false)
       setTopUpStage(false)
+    }
+  }
+
+  // Only a name this wallet holds can carry a record set by it. Reading the
+  // record is a simulation, so it costs nothing before the holder opts in.
+  useEffect(() => {
+    if (chainState !== 'yours' || !walletAddress || !shapeOk) {
+      setMetaState(null)
+      return
+    }
+    let active = true
+    setMetaState(null)
+    void lookupNameMetaAddress(name).then((lookup) => {
+      if (!active) return
+      setMetaState(lookup.status === 'present' ? 'present' : lookup.status === 'absent' ? 'absent' : 'unavailable')
+    })
+    return () => {
+      active = false
+    }
+  }, [chainState, name, shapeOk, walletAddress])
+
+  const handlePublishMetaAddress = async () => {
+    if (!walletAddress) return
+    setMetaBusy(true)
+    setMetaError(null)
+    setMetaNotice(null)
+    try {
+      const feePayer = getFeePayerKeypair()
+      // The viewing secret is derived from the wallet's existing signing seed,
+      // so the same wallet reproduces the same record on another device. Only
+      // the public key is published.
+      const identity = stealthIdentityFromSeed(Uint8Array.from(feePayer.rawSecretKey()))
+      await publishNameMetaAddress({
+        name,
+        metaAddress: identity.metaAddress,
+        walletAddress,
+        feePayerKeypair: feePayer,
+        signAuthEntry: buildSignAuthEntry(),
+      })
+      setMetaState('present')
+      setMetaNotice('Privacy record published. Senders can now derive a one-time address.')
+    } catch (err: unknown) {
+      const raw = err instanceof Error ? err.message : String(err)
+      setMetaError(/cancelled|NotAllowedError/i.test(raw) ? 'Passkey verification was cancelled. Nothing changed.' : raw)
+    } finally {
+      setMetaBusy(false)
+    }
+  }
+
+  const handleRemoveMetaAddress = async () => {
+    if (!walletAddress) return
+    setMetaBusy(true)
+    setMetaError(null)
+    setMetaNotice(null)
+    try {
+      await removeNameMetaAddress({
+        name,
+        walletAddress,
+        feePayerKeypair: getFeePayerKeypair(),
+        signAuthEntry: buildSignAuthEntry(),
+      })
+      setMetaState('absent')
+      setMetaNotice('Privacy record removed. Private payments to this name will be refused.')
+    } catch (err: unknown) {
+      const raw = err instanceof Error ? err.message : String(err)
+      setMetaError(/cancelled|NotAllowedError/i.test(raw) ? 'Passkey verification was cancelled. Nothing changed.' : raw)
+    } finally {
+      setMetaBusy(false)
     }
   }
 
@@ -560,6 +640,65 @@ export default function NamesPage() {
                 </p>
               )}
             </div>
+
+            {/* Privacy record: opt-in, holder-only, removable. It is shown
+                only for a name this wallet holds, because nobody else can set
+                it — and because publishing reveals that this name accepts
+                private payments, which is a choice its owner makes. */}
+            {chainState === 'yours' && walletAddress && metaState !== null && (
+              <div className="mt-6 border-t border-border-dim pt-6">
+                <div className="flex flex-wrap items-start justify-between gap-4">
+                  <div className="max-w-[420px]">
+                    <p className="text-sm font-semibold">Private payments</p>
+                    <p className="mt-1 text-sm leading-relaxed text-off-white/50">
+                      A classic-only sender cannot pay a Veil name, because the name points at a
+                      contract address. Publish a stealth meta-address and a sender can derive a
+                      one-time address instead. This is off until you turn it on, and you can
+                      withdraw it at any time.
+                    </p>
+                  </div>
+                  <span className="rounded-pill border border-border-dim px-3 py-1 text-xs font-semibold uppercase tracking-wider text-off-white/70">
+                    {metaState === 'present' ? 'Published' : metaState === 'absent' ? 'Off' : 'Could not check'}
+                  </span>
+                </div>
+
+                <div className="mt-4 flex flex-wrap items-center gap-3">
+                  {metaState === 'present' ? (
+                    <button
+                      type="button"
+                      disabled={metaBusy}
+                      onClick={() => void handleRemoveMetaAddress()}
+                      className="rounded-pill border border-border-dim px-5 py-2.5 text-sm font-semibold hover:border-gold/40 hover:text-gold disabled:opacity-50"
+                    >
+                      {metaBusy ? 'Waiting for your passkey…' : 'Remove privacy record'}
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      disabled={metaBusy || metaState === 'unavailable'}
+                      onClick={() => void handlePublishMetaAddress()}
+                      className="rounded-pill bg-gold px-5 py-2.5 text-sm font-semibold text-near-black hover:opacity-90 disabled:cursor-not-allowed disabled:bg-surface-md disabled:text-off-white/40"
+                    >
+                      {metaBusy ? 'Waiting for your passkey…' : 'Publish privacy record'}
+                    </button>
+                  )}
+                  <Link
+                    href="/send/private"
+                    className="text-sm text-off-white/60 underline hover:text-off-white"
+                  >
+                    Pay a name privately
+                  </Link>
+                </div>
+
+                {metaState === 'unavailable' && (
+                  <p className="mt-3 text-sm text-off-white/50">
+                    Could not read this name&apos;s privacy record just now. Nothing was changed.
+                  </p>
+                )}
+                {metaNotice && <p className="mt-3 text-sm text-gold">{metaNotice}</p>}
+                {metaError && <p className="mt-3 text-sm text-red-400">{metaError}</p>}
+              </div>
+            )}
           </div>
         </section>
       )}

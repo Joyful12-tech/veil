@@ -858,6 +858,14 @@ export default function SendPage() {
                   ✓ Resolves to: {resolvedAddress.slice(0, 8)}…{resolvedAddress.slice(-8)}
                 </p>
               )}
+              {recipient.includes('*') && (
+                <p className="vw-meta" style={{ marginTop: '6px' }}>
+                  <a href="/send/private" style={{ textDecoration: 'underline' }}>
+                    Pay this name privately instead
+                  </a>{' '}
+                  — the name needs a privacy record, and an ordinary payment here is public.
+                </p>
+              )}
               {nameResolutionError && (
                 <p className="vw-meta" style={{ marginTop: '6px', color: 'var(--coral)' }}>
                   ⚠ {nameResolutionError}

@@ -205,6 +205,93 @@ Reverse lookup (`type=id`, address → name) returns 404 by design: the registry
 is keyed name → address with no reverse index, so answering would mean scanning
 every name.
 
+## Private payments
+
+A Veil name points at a contract address, so a classic-only sender cannot pay
+it. A name can also carry a **stealth meta-address**, a public record from
+which a sender derives a fresh `G…` address for each payment. The payment lands
+at the one-time address instead of the name's contract address, so two payments
+to the same name cannot be linked by destination.
+
+### It is opt-in, and only the holder can turn it on
+
+A name has no privacy record until its holder publishes one. That is enforced
+on-chain: `set_meta_address` requires the holder's authorisation, and no other
+caller can set or replace it. Nobody can make a name accept private payments on
+its owner's behalf.
+
+The record is a single X25519 public key, published in the registry. It is
+public by design — it is meant to be handed out — and it reveals nothing about
+past or future payments.
+
+### Paying a name privately
+
+The sender resolves the name to its meta-address and derives a one-time
+address:
+
+1. Generate an ephemeral X25519 keypair.
+2. Compute the shared secret with the name's viewing public key.
+3. Hash a domain separator, the shared secret and the ephemeral public key into
+   a 32-byte seed, and use it as an Ed25519 keypair.
+4. Pay the `G…` address of that keypair.
+
+Only the ephemeral public key travels with the payment. The holder, with the
+viewing secret and that public key, derives the same keypair and can spend what
+arrived.
+
+The federation response carries the record when there is one, so a SEP-2-capable
+sender can find it without a second protocol:
+
+```json
+{
+  "stellar_address": "jack*useveilapp.xyz",
+  "account_id": "CA7BWBV2L67YVIZWJKLYT3RRCTFCZPN6L5SXYQ4YELWP56E34JFNOEP4",
+  "meta_address": "<base64, 32 bytes>"
+}
+```
+
+The derivation is implemented in the SDK (`deriveStealthPayment`,
+`deriveStealthPrivateKey`), so a sender and a holder in different codebases can
+agree on it byte for byte.
+
+### A name without a record is refused, not sent publicly
+
+This is the important half. If a name has no meta-address, the private send
+flow says so and does not produce a payment. It does **not** fall back to the
+name's public contract address: a public payment made while the screen claimed
+privacy is worse than a refusal, because the sender would never know. The same
+holds when the record cannot be read — "we could not check" is a refusal, not a
+reason to guess.
+
+In the app, [Send privately](/send/private) does the resolution and shows the
+full one-time address. The name's own page, when you hold it, has the controls
+to publish or remove the record.
+
+### Removing the record
+
+The holder can withdraw it at any time with `remove_meta_address`. After that:
+
+- the name refuses private payments again, with the same clear message;
+- a plain payment to the name still works exactly as before;
+- nothing already sent to a one-time address is affected — those funds belong
+  to the viewing secret, not to the record.
+
+A record also stops answering the instant the name expires, because an expired
+name has no holder to stand behind it.
+
+<Callout type="warning">
+The viewing secret is the ability to spend anything sent to any one-time
+address derived from the record. Keep it on your own device; the record itself
+is the public half. In the web wallet it is derived from the wallet's existing
+signing seed, so the same wallet reproduces the same record on another device.
+</Callout>
+
+<Callout type="info">
+A name that changes hands keeps its record until the new holder replaces or
+removes it. If you buy a name that already had one, check the private-payment
+setting before telling anyone to pay it privately.
+</Callout>
+
 ## The exchange limitation
 
 A Veil wallet is a Soroban contract account, so a Veil Name resolves to a `C…`
@@ -237,10 +324,11 @@ second place for funds to go wrong.
 | USDC issuer | `GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN` |
 
 Read-only entry points anyone can call: `quote(name, years)`, `resolve(name)`,
-`state(name)`, `expires_at(name)`, `get_admin()`.
+`state(name)`, `expires_at(name)`, `meta_address(name)`, `get_admin()`.
 
 State-changing: `register(buyer, name, years)`, `renew(payer, name, years)`,
-`set_target(name, target)`.
+`set_target(name, target)`, `set_meta_address(name, meta_address)`,
+`remove_meta_address(name)`.
 
 <Callout type="warning">
 Unlike the Veil wallet and factory, this contract **can be upgraded** by its

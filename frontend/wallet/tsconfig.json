@@ -33,6 +33,9 @@
       "@veil/sdk": [
         "../../sdk/src/index"
       ],
+      "@veil/stealth": [
+        "../../sdk/src/stealth"
+      ],
       "@veil/agent-core": [
         "../../packages/agent/src/handler"
       ],

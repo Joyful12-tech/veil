@@ -55,6 +55,24 @@ export type {
 export * from './webauthn/attestation';
 export * from './recovery/sep30';
 export * from './crypto/prf';
+export {
+    META_ADDRESS_LENGTH,
+    STEALTH_DOMAIN,
+    StealthError,
+    deriveStealthKeys,
+    generateStealthKeys,
+    decodeMetaAddress,
+    deriveStealthPayment,
+    deriveStealthPrivateKey,
+    encodeMetaAddressBase64,
+    decodeMetaAddressBase64,
+} from './stealth';
+export type {
+    StealthMetaAddress,
+    StealthKeys,
+    StealthPayment,
+    StealthPrivateKey,
+} from './stealth';
 // An assertion carries a signature, not a key — these recover the key from it.
 export {
     recoverAssertionPublicKeys,
