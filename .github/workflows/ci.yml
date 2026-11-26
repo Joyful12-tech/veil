@@ -82,7 +82,17 @@ jobs:
           # so the parsing path is unreachable in the deployed contract. Patching
           # forward pulls time-macros, which raises the MSRV to Rust 1.88 and
           # breaks the pinned 1.85 reproducible build.
-          ignore: RUSTSEC-2026-0009
+          # RUSTSEC-2026-0387 (crypto-bigint 0.5.x timing variability):
+          # Soroban SDK 22 pins the host's p256/k256 stack to elliptic-curve 0.13
+          # and crypto-bigint 0.5; the patched 0.7 line requires elliptic-curve
+          # 0.14 and cannot be substituted with a lockfile-only update. In this
+          # repository, production P-256 use validates a supplied PUBLIC key
+          # with VerifyingKey::from_sec1_bytes (factory/src/validation.rs); the
+          # SigningKey constructors are confined to #[cfg(test)] fixtures. The
+          # host's ECDSA operations verify public signatures. No production path
+          # performs private-scalar signing with this dependency. Revisit when
+          # Soroban SDK/host moves to the patched RustCrypto stack.
+          ignore: RUSTSEC-2026-0009, RUSTSEC-2026-0387
 
   contracts:
     name: Rust contracts — build & test
