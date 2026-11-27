@@ -82,17 +82,7 @@ jobs:
           # so the parsing path is unreachable in the deployed contract. Patching
           # forward pulls time-macros, which raises the MSRV to Rust 1.88 and
           # breaks the pinned 1.85 reproducible build.
-          # RUSTSEC-2026-0387 (crypto-bigint 0.5.x timing variability):
-          # Soroban SDK 22 pins the host's p256/k256 stack to elliptic-curve 0.13
-          # and crypto-bigint 0.5; the patched 0.7 line requires elliptic-curve
-          # 0.14 and cannot be substituted with a lockfile-only update. In this
-          # repository, production P-256 use validates a supplied PUBLIC key
-          # with VerifyingKey::from_sec1_bytes (factory/src/validation.rs); the
-          # SigningKey constructors are confined to #[cfg(test)] fixtures. The
-          # host's ECDSA operations verify public signatures. No production path
-          # performs private-scalar signing with this dependency. Revisit when
-          # Soroban SDK/host moves to the patched RustCrypto stack.
-          ignore: RUSTSEC-2026-0009, RUSTSEC-2026-0387
+          ignore: RUSTSEC-2026-0009
 
   contracts:
     name: Rust contracts — build & test
@@ -108,8 +98,13 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: contracts
+      # Kept as its own step: it compiles every crate as a normal (non-test)
+      # build, so a test-only module that is missing its #[cfg(test)] fails
+      # here. `cargo test` builds with cfg(test) set and would not notice.
       - run: cargo build --all
-      - run: cargo test -p invisible-wallet
+      # Every workspace member, not just the wallet (#1406). veil-names and
+      # veil-masquerade are live on mainnet; their tests must gate merges too.
+      - run: cargo test --workspace
 
   sdk:
     name: SDK — typecheck, test & size budget
@@ -140,6 +135,8 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: ./coverage/lcov.info
           fail_ci_if_error: false
+      - name: Single-function browser tree shaking
+        run: npm run test:tree-shaking
       - name: Bundle size budget (size-limit)
         run: npm run size
       # Packs the SDK, installs the tarball into a throwaway consumer, and
