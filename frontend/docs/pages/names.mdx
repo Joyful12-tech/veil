@@ -229,6 +229,10 @@ second place for funds to go wrong.
 
 ## Paying a name privately
 
+<Callout type="warning">
+**Not available in the wallet yet.** The registry methods described below are being proposed separately and require an approved contract upgrade. Even after the registry supports meta-addresses, Veil must implement recipient scanning and claim/recovery before it can safely offer private sends. Until then, the wallet does not offer "Pay privately" and you must not send funds to a manually derived one-time address.
+</Callout>
+
 A Veil name resolves to a `C…` contract address, so a classic-only sender
 cannot pay it at all. A **stealth meta-address** is an optional second record on
 a name: two public keys its holder publishes, from which every sender derives a
@@ -314,11 +318,13 @@ API says so explicitly:
 GET https://app.useveilapp.xyz/api/names/meta?q=ada*useveilapp.xyz
 ```
 
-A published record answers `200` with the two keys. A name that never opted in
-answers `404` with `NO_META_ADDRESS` and a sentence stating that paying it is a
-public payment. The app refuses to derive a one-time address from either a
-missing record or one it could not read, and a plain payment to the name is
-still possible — but it is labelled as public, never presented as private.
+When the testnet preview is enabled and the deployed registry supports the
+method, a published record answers `200` with the two keys. A successful lookup
+that returns no record answers `404` with `NO_META_ADDRESS`. A disabled preview,
+an older registry without `meta_address`, or an RPC failure answers `503` —
+none of those failures is treated as proof that the holder did not opt in.
+The wallet does not offer private sending until it can scan for and recover
+the resulting payment.
 
 The contract's `meta_address(name)` also returns `None` for an expired name, so
 a sender cannot derive an address for a name nobody holds.
@@ -332,12 +338,16 @@ a sender cannot derive an address for a name nobody holds.
 | Payment asset | USDC — `CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75` |
 | USDC issuer | `GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN` |
 
-Read-only entry points anyone can call: `quote(name, years)`, `resolve(name)`,
-`state(name)`, `expires_at(name)`, `meta_address(name)`, `get_admin()`.
+Currently deployed read-only entry points anyone can call: `quote(name, years)`,
+`resolve(name)`, `state(name)`, `expires_at(name)`, `get_admin()`.
 
-State-changing: `register(buyer, name, years)`, `renew(payer, name, years)`,
-`set_target(name, target)`, `set_meta_address(name, spend_key, view_key)`,
-`remove_meta_address(name)`.
+Currently deployed state-changing entry points: `register(buyer, name, years)`,
+`renew(payer, name, years)`, `set_target(name, target)`.
+
+The proposed registry upgrade adds `meta_address(name)`,
+`set_meta_address(name, spend_key, view_key)`, and
+`remove_meta_address(name)`. They will be callable only after maintainers
+approve and deploy that upgrade.
 
 <Callout type="warning">
 Unlike the Veil wallet and factory, this contract **can be upgraded** by its
