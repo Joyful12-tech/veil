@@ -196,13 +196,19 @@ export type NameResolver = (name: string) => Promise<string | null>
  * part. `federation.ts` on the client draws exactly this distinction, and
  * `reverseResolution.ts` already degrades to null on an outage.
  */
-async function readRegistry(method: string, args: ReturnType<typeof nativeToScVal>[]): Promise<unknown> {
+async function readRegistry(method: string, args: ReturnType<typeof nativeToScVal>[], failClosed = false): Promise<unknown> {
   const contractId = getNamesContractId()
-  if (!contractId) return null
+  if (!contractId) {
+    if (failClosed) throw new Error('The names registry is not deployed on this network.')
+    return null
+  }
 
   const network = serverNetwork()
   const upstreams = network.rpcUrls
-  if (upstreams.length === 0) return null
+  if (upstreams.length === 0) {
+    if (failClosed) throw new Error('No Soroban RPC upstream is configured.')
+    return null
+  }
 
   // Every upstream in turn, not just the first.
   //
@@ -213,6 +219,7 @@ async function readRegistry(method: string, args: ReturnType<typeof nativeToScVa
   // reports a name as unregistered because one provider was unreachable is
   // worse than one that is down — the answer looks authoritative.
   let sawTransportFailure = false
+  let sawSimulationFailure = false
 
   for (const rpcUrl of upstreams) {
     try {
@@ -233,9 +240,12 @@ async function readRegistry(method: string, args: ReturnType<typeof nativeToScVa
 
       const sim = await server.simulateTransaction(tx)
       if (!SorobanRpc.Api.isSimulationSuccess(sim) || !sim.result) {
-        // The chain answered and the answer was "no". That is a real result,
-        // not a transport problem, so no other provider would say otherwise.
-        return null
+        // A failed simulation is not the same as a successful Option::None.
+        // In particular, an older deployed registry may not implement this
+        // method. Keep trying providers, then report the lookup as unavailable
+        // rather than telling the sender that the owner did not opt in.
+        sawSimulationFailure = true
+        continue
       }
 
       return scValToNative(sim.result.retval)
@@ -244,6 +254,12 @@ async function readRegistry(method: string, args: ReturnType<typeof nativeToScVa
     }
   }
 
+  if (failClosed) {
+    const reason = sawSimulationFailure
+      ? `The names registry could not simulate ${method}; the deployed contract may not support it.`
+      : `Every RPC upstream failed while reading ${method}.`
+    throw new Error(reason)
+  }
   if (sawTransportFailure) {
     // eslint-disable-next-line no-console
     console.warn(`[federation] every RPC upstream failed reading ${method}`)
@@ -290,7 +306,7 @@ function toHex(value: unknown): string | null {
 export async function resolveMetaAddressOnChain(
   name: string,
 ): Promise<{ spend_key: string; view_key: string } | null> {
-  const value = await readRegistry('meta_address', [nativeToScVal(name, { type: 'string' })])
+  const value = await readRegistry('meta_address', [nativeToScVal(name, { type: 'string' })], true)
   if (!value || typeof value !== 'object') return null
 
   // `scValToNative` on a struct returns an object keyed by its field names.
