@@ -64,7 +64,30 @@ export async function GET(req: NextRequest) {
     })
   }
 
-  const record = await lookupNameMetaAddress(q)
+  // Stealth name lookups are a testnet-only, explicitly opted-in preview.
+  // The mainnet registry has not been upgraded with meta_address, so querying
+  // it must never be presented as evidence that a holder has not opted in.
+  const privacyFlagOn =
+    process.env.NEXT_PUBLIC_PRIVACY_FEATURE_FLAG === '1' ||
+    process.env.NEXT_PUBLIC_PRIVACY_FEATURE_FLAG === 'true'
+  if (process.env.VEIL_FEDERATION_NETWORK !== 'testnet' || !privacyFlagOn) {
+    return errorJson(503, {
+      error: 'PRIVACY_DISABLED',
+      detail: 'Stealth name lookup is available only on testnet when the privacy preview is enabled.',
+    })
+  }
+
+  let record
+  try {
+    record = await lookupNameMetaAddress(q)
+  } catch {
+    // Missing contract methods, RPC outages and simulation failures are all
+    // unavailable lookups, not proof that a name has no published record.
+    return errorJson(503, {
+      error: 'META_ADDRESS_LOOKUP_UNAVAILABLE',
+      detail: 'The names registry could not answer the stealth meta-address lookup. Please try again later.',
+    })
+  }
   if (!record) {
     return errorJson(404, {
       error: 'NO_META_ADDRESS',
