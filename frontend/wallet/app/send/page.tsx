@@ -8,6 +8,10 @@ import { Shield } from 'lucide-react'
 import { useState, useEffect, useRef } from 'react'
 import { useRouter } from 'next/navigation'
 import { resolveFederation } from '@/lib/federation'
+import {
+  lookupNameMetaAddress,
+  type NameMetaLookup,
+} from '@/lib/namesMetaAddress'
 
 import {
   Keypair, TransactionBuilder, BASE_FEE, Asset, Operation, Memo,
@@ -28,7 +32,7 @@ import { getRegisteredAsset } from '@/lib/assets'
 import { buildSep7Memo, type Sep7MemoType } from '@/lib/sep7'
 import { passkeyErrorMessage } from '@/lib/passkeyAuth'
 import { isPasskeyCancellation } from '@/lib/passkeyOutcome'
-import { horizonErrorMessage } from '@/lib/horizonError'
+import { horizonErrorMessage, loadPayingAccount } from '@/lib/horizonError'
 import { spendableNativeXlm } from '@/lib/reserves'
 import { validateMemoText } from '@/lib/memo'
 
@@ -37,6 +41,11 @@ import { beginTx, endTx } from '@/lib/txState'
 import { fetchPrices } from '@/lib/fetchPrice'
 import { formatFiat, hydrateCurrency, useCurrency } from '@/lib/currency'
 import { isPrivacyEnabled } from '@/lib/privacy/config'
+import { getConnectApp, referenceMemo, type PendingConnect } from '@/lib/connect'
+import { ALLOW_DEMO_APP, answer, clearPending, readPending } from '@/lib/connectWindow'
+import { readContractAssetBalances } from '@/lib/contractAssets'
+import { movableWalletAssets, walletBalanceToOffer, type IssuedWalletAsset } from '@/lib/moveFromWallet'
+import { moveAssetToSpending } from '@/lib/moveToSpending'
 // TODO(#1003): remove platform limitation warning when multi-origin contract ships
 import {
   FIRST_SPEND_LIMITATION_MESSAGE,
@@ -90,6 +99,12 @@ export default function SendPage() {
   const [resolvedAddress, setResolvedAddress] = useState<string | null>(null)
   const [isResolvingName, setIsResolvingName] = useState(false)
   const [nameResolutionError, setNameResolutionError] = useState<string | null>(null)
+  /**
+   * Whether this name accepts stealth payments. Fetched separately from
+   * federation on purpose: the public address a name resolves to says nothing
+   * about whether its holder opted in to private payments.
+   */
+  const [metaLookup, setMetaLookup] = useState<NameMetaLookup>({ status: 'idle' })
   const [amount, setAmount]           = useState('')
   const [memo, setMemo]               = useState('')
   // TODO(#1003): remove platform limitation warning when multi-origin contract ships
@@ -101,18 +116,27 @@ export default function SendPage() {
       setResolvedAddress(null)
       setNameResolutionError(null)
       setIsResolvingName(false)
+      setMetaLookup({ status: 'idle' })
       return
     }
 
     let active = true
     setIsResolvingName(true)
     setNameResolutionError(null)
+    // Meta-address lookups are testnet-only and opt-in, just like the rest of
+    // the privacy preview. Mainnet must never interpret an older registry's
+    // missing method as evidence that a name has not published a record.
+    setMetaLookup(isPrivacyEnabled() ? { status: 'checking' } : { status: 'idle' })
 
     resolveFederation(trimmed)
-      .then((res) => {
-        if (active) {
-          setResolvedAddress(res.account_id)
-          setIsResolvingName(false)
+      .then(async (res) => {
+        if (!active) return
+        setResolvedAddress(res.account_id)
+        setIsResolvingName(false)
+
+        if (isPrivacyEnabled()) {
+          const lookup = await lookupNameMetaAddress(trimmed)
+          if (active) setMetaLookup(lookup)
         }
       })
       .catch((err) => {
@@ -120,6 +144,9 @@ export default function SendPage() {
           setResolvedAddress(null)
           setNameResolutionError(err instanceof Error ? err.message : 'Could not resolve federation name')
           setIsResolvingName(false)
+          setMetaLookup(isPrivacyEnabled()
+            ? { status: 'unknown', name: trimmed, message: 'The name could not be resolved, so its privacy record could not be checked.' }
+            : { status: 'idle' })
         }
       })
 
@@ -206,6 +233,43 @@ export default function SendPage() {
     }
   }, [step])
   const [txHash, setTxHash]           = useState<string | null>(null)
+  /** The address the payment left: the spending account, told to a Veil Connect app. */
+  const [paidFrom, setPaidFrom]       = useState<string | null>(null)
+  /**
+   * Set when another app opened this window through Veil Connect and asked
+   * for this payment. It changes nothing about how the payment is made: it
+   * only names the app on screen and tells it the hash afterwards.
+   */
+  const [connectPay, setConnectPay] = useState<PendingConnect | null>(null)
+  const [connectTold, setConnectTold] = useState(false)
+  useEffect(() => {
+    const pending = readPending()
+    if (pending?.request.type === 'pay') setConnectPay(pending)
+  }, [])
+  const connectMemoLocked =
+    connectPay?.request.type === 'pay' && referenceMemo(connectPay.request.reference) !== null
+  const connectAppName = connectPay ? getConnectApp(connectPay.appId, ALLOW_DEMO_APP)?.name ?? null : null
+  // Tell the app as soon as the payment is through, so closing this window
+  // early does not leave it waiting.
+  useEffect(() => {
+    if (step !== 'done' || !txHash || !paidFrom || !connectPay || connectPay.request.type !== 'pay' || connectTold) return
+    // The fields can be edited after the hand-off. If what was sent is not
+    // what the app asked for, say so instead of passing it off as its payment.
+    const asked = connectPay.request
+    const sentTo = (resolvedAddress ?? recipient).trim()
+    const askedMemo = referenceMemo(asked.reference)
+    const matches = sentTo === asked.to
+      && Number(amount) === Number(asked.amount)
+      && selectedAsset?.code === asked.asset
+      // The reference is how the app's server knows whose payment this is.
+      && (askedMemo === null || (memo.trim() === askedMemo && memoIsText))
+    answer(connectPay, matches
+      ? { ok: true, type: 'pay', hash: txHash, reference: asked.reference, network: getNetworkName(), from: paidFrom, memo: askedMemo }
+      : { ok: false, error: 'refused', reason: 'A payment was sent, but not the one that was asked for.' })
+    clearPending()
+    setConnectTold(true)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [step, txHash, paidFrom, connectPay, connectTold])
   const [errorMsg, setErrorMsg]       = useState<string | null>(null)
   const [showPicker, setShowPicker]   = useState(false)
 
@@ -228,6 +292,27 @@ export default function SendPage() {
   const [showAssets, setShowAssets]       = useState(false)
   const [prices, setPrices]               = useState<Record<string, number | null>>({})
   const { code: currencyCode, rate: fxRate } = useCurrency()
+
+  // Send spends from the G spending account. Money of the same asset held by
+  // the C wallet cannot be paid from here, so it is offered as a move first.
+  // This matters most for a payment another app asked for (Veil Connect),
+  // which opens this screen directly.
+  const [walletHeld, setWalletHeld]   = useState<IssuedWalletAsset[]>([])
+  const [isMoving, setIsMoving]       = useState(false)
+  const [moveError, setMoveError]     = useState<string | null>(null)
+  /** Bumped after a move so the balances below are read again. */
+  const [balancesNonce, setBalancesNonce] = useState(0)
+
+  useEffect(() => {
+    const addr = walletSession.getItem('invisible_wallet_address')
+    if (!addr) return
+    let active = true
+    const wanted = requestedAsset ? [{ ...requestedAsset, balance: '0' }] : []
+    readContractAssetBalances(addr, wanted)
+      .then((held) => { if (active) setWalletHeld(movableWalletAssets(held)) })
+      .catch(() => { /* a failed read offers nothing; it never invents a balance */ })
+    return () => { active = false }
+  }, [requestedAsset, balancesNonce])
 
   useEffect(() => {
     const addr = walletSession.getItem('invisible_wallet_address')
@@ -271,13 +356,37 @@ export default function SendPage() {
         }
       })
       setAssets(list)
-      if (list.length > 0) setSelectedAsset(list[0])
+      // Keep whatever was selected across a reload (after a move); the first
+      // load has nothing selected and takes the first asset.
+      setSelectedAsset((prev) =>
+        list.find((a) => prev && a.code === prev.code && a.issuer === prev.issuer) ?? list[0] ?? null,
+      )
     }).catch(() => {
       const xlm: WalletAsset = { code: 'XLM', issuer: null, contractId: getNativeAssetContractId(), balance: '0' }
       setAssets([xlm])
       setSelectedAsset(xlm)
     })
-  }, [router])
+  }, [router, balancesNonce])
+
+  const walletOffer = walletBalanceToOffer(selectedAsset, walletHeld, amount)
+
+  async function handleMoveFromWallet(asset: IssuedWalletAsset) {
+    const addr = walletSession.getItem('invisible_wallet_address')
+    if (!addr) { router.replace('/lock'); return }
+    setIsMoving(true)
+    setMoveError(null)
+    try {
+      await moveAssetToSpending(asset, addr)
+      setBalancesNonce((n) => n + 1)
+    } catch (err: unknown) {
+      // Closing the passkey prompt moved nothing; the offer simply stays.
+      if (!isPasskeyCancellation(err)) {
+        setMoveError(horizonErrorMessage(err) ?? passkeyErrorMessage(err))
+      }
+    } finally {
+      setIsMoving(false)
+    }
+  }
 
   useEffect(() => { hydrateCurrency() }, [])
   useEffect(() => {
@@ -452,9 +561,14 @@ export default function SendPage() {
 
       const horizonServer = new Server(network.horizonUrl)
       const destination = resolvedAddress ?? recipient
+      if (!destination) {
+        setErrorMsg('No payment destination was resolved.')
+        setStep('error')
+        return
+      }
 
       if (destination.startsWith('G') && destination.length === 56) {
-        const account = await horizonServer.loadAccount(feePayerKp.publicKey())
+        const account = await loadPayingAccount(() => horizonServer.loadAccount(feePayerKp.publicKey()))
         const builder = new TransactionBuilder(account, {
           fee: inclusionFee(),
           networkPassphrase: network.networkPassphrase,
@@ -521,6 +635,7 @@ export default function SendPage() {
         const tx = builder.build()
         tx.sign(feePayerKp)
         const result = await horizonServer.submitTransaction(tx)
+        setPaidFrom(feePayerKp.publicKey())
         setTxHash(result.hash)
         // TODO(#1003): remove platform limitation call when multi-origin contract ships
         markFirstSpendCompleted(walletSession.getItem('invisible_wallet_address') || walletLocal.getItem('invisible_wallet_address'))
@@ -540,6 +655,9 @@ export default function SendPage() {
             nativeToScVal(destination,            { type: 'address' }),
             nativeToScVal(amountStroops,          { type: 'i128' }),
           ))
+          // The memo rides on this path too. It used to be dropped here, so a
+          // payment to a contract address lost the reference it was sent with.
+          .addMemo(memo.trim() ? buildStellarMemo(memo, memoType) ?? Memo.none() : Memo.none())
           .setTimeout(30)
           .build()
 
@@ -564,6 +682,7 @@ export default function SendPage() {
           }
           await new Promise(r => setTimeout(r, 1_000))
         }
+        setPaidFrom(feePayerKp.publicKey())
         setTxHash(sendResult.hash)
         // TODO(#1003): remove platform limitation call when multi-origin contract ships
         markFirstSpendCompleted(walletSession.getItem('invisible_wallet_address') || walletLocal.getItem('invisible_wallet_address'))
@@ -603,6 +722,11 @@ export default function SendPage() {
       <main className="wallet-main wallet-main--wide">
         <div style={{ marginBottom: '1.75rem' }}>
           <PageHeader eyebrow="Transfer" title="Send money" />
+          {connectAppName && connectPay?.request.type === 'pay' && step !== 'done' && (
+            <p className="card" style={{ fontSize: '0.85rem', padding: '0.75rem 1rem' }}>
+              {connectAppName} asked for this payment (reference {connectPay.request.reference}). Check the address and the amount before you confirm.
+            </p>
+          )}
         </div>
 
         {/* Entry to the #716 private-send flow. Flag-gated and testnet-only
@@ -653,6 +777,30 @@ export default function SendPage() {
               <p role="alert" style={{ fontSize: '0.8125rem', color: 'var(--teal)', lineHeight: 1.5 }}>
                 Payment request refused. {requestError}
               </p>
+            )}
+
+            {walletOffer && (
+              <div className="card" style={{ padding: '0.875rem 1rem' }}>
+                <p style={{ fontSize: '0.8125rem', lineHeight: 1.5, marginBottom: '0.625rem' }}>
+                  You have {walletOffer.balance} {walletOffer.code} in your wallet address. Move it to your spending wallet to pay with it. You will be asked for your passkey.
+                </p>
+                {moveError && (
+                  <p role="alert" style={{ fontSize: '0.75rem', color: 'var(--teal)', lineHeight: 1.5, marginBottom: '0.625rem' }}>
+                    {moveError}
+                  </p>
+                )}
+                <button
+                  type="button"
+                  className="btn-secondary"
+                  onClick={() => void handleMoveFromWallet(walletOffer)}
+                  disabled={isMoving}
+                  style={{ fontSize: '0.875rem', padding: '0.625rem 1.25rem', width: 'auto' }}
+                >
+                  {isMoving
+                    ? <div className="spinner" style={{ width: '14px', height: '14px' }} />
+                    : `Move ${walletOffer.balance} ${walletOffer.code}`}
+                </button>
+              </div>
             )}
 
             <div>
@@ -854,13 +1002,50 @@ export default function SendPage() {
                 <p className="vw-meta" style={{ marginTop: '6px' }}>Resolving federation address…</p>
               )}
               {resolvedAddress && (
-                <p className="vw-meta" style={{ marginTop: '6px', color: 'var(--teal)' }}>
-                  ✓ Resolves to: {resolvedAddress.slice(0, 8)}…{resolvedAddress.slice(-8)}
+                <p
+                  className="vw-meta"
+                  style={{ marginTop: '6px', color: 'var(--teal)', fontFamily: 'Inconsolata, monospace', wordBreak: 'break-all' }}
+                >
+                  ✓ Resolves to: {resolvedAddress}
                 </p>
               )}
               {nameResolutionError && (
                 <p className="vw-meta" style={{ marginTop: '6px', color: 'var(--coral)' }}>
                   ⚠ {nameResolutionError}
+                </p>
+              )}
+
+              {/* Private payment is opt-in, and only offered when the name
+                  actually published a meta-address. A name without one gets a
+                  refusal that says the payment is public — never a silent
+                  fallback behind a privacy label. */}
+              {isPrivacyEnabled() && !nameResolutionError && metaLookup.status === 'checking' && (
+                <p className="vw-meta" style={{ marginTop: '6px' }}>
+                  Checking for a stealth meta-address…
+                </p>
+              )}
+
+              {isPrivacyEnabled() && metaLookup.status === 'published' && (
+                <p className="vw-meta" style={{ marginTop: '0.75rem', lineHeight: 1.5 }}>
+                  This name has published a stealth meta-address. Private sending is not available yet because Veil cannot scan for and recover the resulting payment. Continue only with a clearly public payment.
+                </p>
+              )}
+
+              {isPrivacyEnabled() && metaLookup.status === 'not-published' && (
+                <p
+                  role="alert"
+                  style={{ marginTop: '0.75rem', padding: '0.75rem 0.875rem', borderRadius: '0.625rem', border: '1px solid rgba(255,68,68,0.35)', background: 'rgba(255,68,68,0.08)', color: '#ff8888', fontSize: '0.8125rem', lineHeight: 1.5 }}
+                >
+                  {metaLookup.message}
+                </p>
+              )}
+
+              {isPrivacyEnabled() && metaLookup.status === 'unknown' && (
+                <p
+                  role="alert"
+                  style={{ marginTop: '0.75rem', padding: '0.75rem 0.875rem', borderRadius: '0.625rem', border: '1px solid rgba(253,218,36,0.35)', background: 'rgba(253,218,36,0.07)', color: 'var(--gold)', fontSize: '0.8125rem', lineHeight: 1.5 }}
+                >
+                  {metaLookup.message}
                 </p>
               )}
               {imgError && (
@@ -879,6 +1064,9 @@ export default function SendPage() {
                 placeholder="Add a note for the recipient"
                 value={memo}
                 onChange={e => setMemo(e.target.value)}
+                // A reference another app put here is how it finds the payment.
+                // Editing it would send money the app could not match.
+                readOnly={connectMemoLocked}
                 aria-invalid={memoFieldError ? true : undefined}
                 aria-describedby={memoFieldError ? 'send-memo-error' : undefined}
               />
@@ -961,7 +1149,7 @@ export default function SendPage() {
               <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
                 <Row label="To"      value={recipient.includes('*') ? recipient : `${recipient.slice(0, 8)}...${recipient.slice(-8)}`} mono />
                 {resolvedAddress && (
-                  <Row label="Resolved Address" value={`${resolvedAddress.slice(0, 8)}...${resolvedAddress.slice(-8)}`} mono />
+                  <Row label="Resolved Address" value={resolvedAddress} mono />
                 )}
                 <Row label="Amount"  value={`${amount} ${selectedAsset?.code ?? 'XLM'}`} mono />
                 {selectedAsset?.issuer && (
@@ -1036,9 +1224,15 @@ export default function SendPage() {
                 </p>
               )}
             </div>
-            <button className="btn-gold" onClick={() => router.push('/dashboard')}>
-              Done
-            </button>
+            {connectAppName ? (
+              <button className="btn-gold" onClick={() => { try { window.close() } catch { /* stays open */ } router.push('/dashboard') }}>
+                Back to {connectAppName}
+              </button>
+            ) : (
+              <button className="btn-gold" onClick={() => router.push('/dashboard')}>
+                Done
+              </button>
+            )}
           </div>
         )}
 
