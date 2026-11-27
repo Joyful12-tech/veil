@@ -12,7 +12,6 @@ import {
   lookupNameMetaAddress,
   type NameMetaLookup,
 } from '@/lib/namesMetaAddress'
-import { deriveStealthAddress, type StealthPayment } from '@/lib/stealthAddress'
 
 import {
   Keypair, TransactionBuilder, BASE_FEE, Asset, Operation, Memo,
@@ -106,10 +105,6 @@ export default function SendPage() {
    * about whether its holder opted in to private payments.
    */
   const [metaLookup, setMetaLookup] = useState<NameMetaLookup>({ status: 'idle' })
-  /** The one-time address for this payment, once the sender asks for one. */
-  const [stealthPayment, setStealthPayment] = useState<StealthPayment | null>(null)
-  /** Opt-in, because paying a public address is a legitimate choice. */
-  const [payPrivately, setPayPrivately] = useState(false)
   const [amount, setAmount]           = useState('')
   const [memo, setMemo]               = useState('')
   // TODO(#1003): remove platform limitation warning when multi-origin contract ships
@@ -117,12 +112,6 @@ export default function SendPage() {
 
   useEffect(() => {
     const trimmed = recipient.trim()
-    // Any edit to the recipient invalidates a derived address. Keeping one
-    // would let a typo-fixed name be paid at the previous name's one-time
-    // address, which is the same class of bug as a stale contact.
-    setStealthPayment(null)
-    setPayPrivately(false)
-
     if (!trimmed.includes('*')) {
       setResolvedAddress(null)
       setNameResolutionError(null)
@@ -134,7 +123,10 @@ export default function SendPage() {
     let active = true
     setIsResolvingName(true)
     setNameResolutionError(null)
-    setMetaLookup({ status: 'checking' })
+    // Meta-address lookups are testnet-only and opt-in, just like the rest of
+    // the privacy preview. Mainnet must never interpret an older registry's
+    // missing method as evidence that a name has not published a record.
+    setMetaLookup(isPrivacyEnabled() ? { status: 'checking' } : { status: 'idle' })
 
     resolveFederation(trimmed)
       .then(async (res) => {
@@ -142,17 +134,19 @@ export default function SendPage() {
         setResolvedAddress(res.account_id)
         setIsResolvingName(false)
 
-        // Only our own names can carry a meta-address; another domain's
-        // federation server has no such record to ask for.
-        const lookup = await lookupNameMetaAddress(trimmed)
-        if (active) setMetaLookup(lookup)
+        if (isPrivacyEnabled()) {
+          const lookup = await lookupNameMetaAddress(trimmed)
+          if (active) setMetaLookup(lookup)
+        }
       })
       .catch((err) => {
         if (active) {
           setResolvedAddress(null)
           setNameResolutionError(err instanceof Error ? err.message : 'Could not resolve federation name')
           setIsResolvingName(false)
-          setMetaLookup({ status: 'unknown', name: trimmed, message: 'The name could not be resolved, so its privacy record could not be checked.' })
+          setMetaLookup(isPrivacyEnabled()
+            ? { status: 'unknown', name: trimmed, message: 'The name could not be resolved, so its privacy record could not be checked.' }
+            : { status: 'idle' })
         }
       })
 
@@ -494,46 +488,12 @@ export default function SendPage() {
     }
   }
 
-  /**
-   * Turn the private option on or off.
-   *
-   * Enabling it is only possible with a published record. The address is
-   * derived once here, from a fresh ephemeral secret, so what is shown on the
-   * review screen is exactly what will be paid.
-   */
-  function togglePrivatePayment(next: boolean) {
-    setStealthPayment(null)
-    if (!next) {
-      setPayPrivately(false)
-      return
-    }
-    if (metaLookup.status !== 'published') {
-      // Refuse rather than fall back. A private send with no record to derive
-      // from would be a public payment wearing a privacy label.
-      setPayPrivately(false)
-      return
-    }
-    try {
-      setStealthPayment(deriveStealthAddress(metaLookup.meta))
-      setPayPrivately(true)
-    } catch (err) {
-      setPayPrivately(false)
-      setMetaLookup({
-        status: 'unknown',
-        name: metaLookup.name,
-        message: err instanceof Error ? err.message : 'The meta-address could not be used.',
-      })
-    }
-  }
-
   function validateForm(): boolean {
     const isFederated = recipient.trim().includes('*')
     const validAddress = isFederated
       ? Boolean(resolvedAddress)
       : (recipient.startsWith('G') || recipient.startsWith('C')) && recipient.length === 56
     if (!validAddress) return false
-    // A private payment is only valid with the one-time address it derived.
-    if (payPrivately && !stealthPayment) return false
     if (isNaN(parseFloat(amount)) || parseFloat(amount) <= 0) return false
     if (!selectedAsset) return false
     if (lockedAssetMismatch()) return false
@@ -600,15 +560,9 @@ export default function SendPage() {
       }
 
       const horizonServer = new Server(network.horizonUrl)
-      // When the sender asked to pay privately, the destination is the derived
-      // one-time address — never the name's public address. The two must not
-      // be interchangeable, or a derivation failure becomes a public payment
-      // on the same screen that promises privacy.
-      const destination = payPrivately
-        ? stealthPayment?.oneTimeAddress
-        : resolvedAddress ?? recipient
+      const destination = resolvedAddress ?? recipient
       if (!destination) {
-        setErrorMsg('No one-time address was derived for this private payment.')
+        setErrorMsg('No payment destination was resolved.')
         setStep('error')
         return
       }
@@ -1065,54 +1019,19 @@ export default function SendPage() {
                   actually published a meta-address. A name without one gets a
                   refusal that says the payment is public — never a silent
                   fallback behind a privacy label. */}
-              {!nameResolutionError && metaLookup.status === 'checking' && (
+              {isPrivacyEnabled() && !nameResolutionError && metaLookup.status === 'checking' && (
                 <p className="vw-meta" style={{ marginTop: '6px' }}>
                   Checking for a stealth meta-address…
                 </p>
               )}
 
-              {metaLookup.status === 'published' && (
-                <div
-                  style={{
-                    marginTop: '0.75rem',
-                    padding: '0.875rem 1rem',
-                    borderRadius: '0.75rem',
-                    border: '1px solid rgba(0,167,181,0.3)',
-                    background: 'rgba(0,167,181,0.08)',
-                  }}
-                >
-                  <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.8125rem', cursor: 'pointer' }}>
-                    <input
-                      type="checkbox"
-                      checked={payPrivately}
-                      onChange={e => togglePrivatePayment(e.target.checked)}
-                    />
-                    <span>Pay privately with a one-time address</span>
-                  </label>
-                  {stealthPayment ? (
-                    <div style={{ marginTop: '0.75rem', display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-                      <div>
-                        <div className="vw-fieldlabel" style={{ marginBottom: 2 }}>One-time address</div>
-                        <p style={{ fontFamily: 'Inconsolata, monospace', fontSize: '0.75rem', wordBreak: 'break-all' }}>
-                          {stealthPayment.oneTimeAddress}
-                        </p>
-                      </div>
-                      <div>
-                        <div className="vw-fieldlabel" style={{ marginBottom: 2 }}>Ephemeral public key (send it with the payment)</div>
-                        <p style={{ fontFamily: 'Inconsolata, monospace', fontSize: '0.75rem', wordBreak: 'break-all' }}>
-                          {stealthPayment.ephemeralPublicKey}
-                        </p>
-                      </div>
-                    </div>
-                  ) : (
-                    <p className="vw-meta" style={{ marginTop: '0.5rem' }}>
-                      Veil will derive a fresh address for this payment when you tick the box.
-                    </p>
-                  )}
-                </div>
+              {isPrivacyEnabled() && metaLookup.status === 'published' && (
+                <p className="vw-meta" style={{ marginTop: '0.75rem', lineHeight: 1.5 }}>
+                  This name has published a stealth meta-address. Private sending is not available yet because Veil cannot scan for and recover the resulting payment. Continue only with a clearly public payment.
+                </p>
               )}
 
-              {metaLookup.status === 'not-published' && (
+              {isPrivacyEnabled() && metaLookup.status === 'not-published' && (
                 <p
                   role="alert"
                   style={{ marginTop: '0.75rem', padding: '0.75rem 0.875rem', borderRadius: '0.625rem', border: '1px solid rgba(255,68,68,0.35)', background: 'rgba(255,68,68,0.08)', color: '#ff8888', fontSize: '0.8125rem', lineHeight: 1.5 }}
@@ -1121,7 +1040,7 @@ export default function SendPage() {
                 </p>
               )}
 
-              {metaLookup.status === 'unknown' && (
+              {isPrivacyEnabled() && metaLookup.status === 'unknown' && (
                 <p
                   role="alert"
                   style={{ marginTop: '0.75rem', padding: '0.75rem 0.875rem', borderRadius: '0.625rem', border: '1px solid rgba(253,218,36,0.35)', background: 'rgba(253,218,36,0.07)', color: 'var(--gold)', fontSize: '0.8125rem', lineHeight: 1.5 }}
@@ -1231,13 +1150,6 @@ export default function SendPage() {
                 <Row label="To"      value={recipient.includes('*') ? recipient : `${recipient.slice(0, 8)}...${recipient.slice(-8)}`} mono />
                 {resolvedAddress && (
                   <Row label="Resolved Address" value={resolvedAddress} mono />
-                )}
-                {payPrivately && stealthPayment && (
-                  <>
-                    <Row label="Payment" value="Private · one-time address" />
-                    <Row label="One-time address" value={stealthPayment.oneTimeAddress} mono />
-                    <Row label="Ephemeral public key" value={stealthPayment.ephemeralPublicKey} mono />
-                  </>
                 )}
                 <Row label="Amount"  value={`${amount} ${selectedAsset?.code ?? 'XLM'}`} mono />
                 {selectedAsset?.issuer && (
