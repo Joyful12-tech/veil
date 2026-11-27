@@ -20,6 +20,16 @@ function get(query: string): NextRequest {
 }
 
 describe('GET /api/names/meta', () => {
+  const savedEnv = { ...process.env }
+
+  beforeEach(() => {
+    delete process.env.VEIL_FEDERATION_NETWORK
+    delete process.env.NEXT_PUBLIC_PRIVACY_FEATURE_FLAG
+  })
+
+  afterAll(() => {
+    process.env = { ...savedEnv }
+  })
   it('400s without q', async () => {
     const res = await GET(get(''))
     expect(res.status).toBe(400)
@@ -36,17 +46,18 @@ describe('GET /api/names/meta', () => {
     expect((await GET(get('?q=ada'))).status).toBe(400)
   })
 
-  it('404s with a machine-readable code when there is no record', async () => {
-    // No registry is reachable in this environment, so the reader answers
-    // null. The route must not turn that into `{}` — a sender cannot derive
-    // anything from an absent record, and a public fallback is exactly what
-    // this endpoint exists to prevent.
+  it('does not query the registry when the testnet privacy preview is disabled', async () => {
     const res = await GET(get('?q=ada*useveilapp.xyz'))
-    expect(res.status).toBe(404)
+    expect(res.status).toBe(503)
+    expect((await res.json()).error).toBe('PRIVACY_DISABLED')
+  })
 
-    const body = await res.json()
-    expect(body.error).toBe('NO_META_ADDRESS')
-    expect(body.detail).toContain('public payment')
+  it('treats an unavailable or old registry as unavailable, not as no record', async () => {
+    process.env.VEIL_FEDERATION_NETWORK = 'testnet'
+    process.env.NEXT_PUBLIC_PRIVACY_FEATURE_FLAG = '1'
+    const res = await GET(get('?q=ada*useveilapp.xyz'))
+    expect(res.status).toBe(503)
+    expect((await res.json()).error).toBe('META_ADDRESS_LOOKUP_UNAVAILABLE')
   })
 
   it('never caches, because a record can be published or removed', async () => {
